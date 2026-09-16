@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "linstop"
+version = "0.1.0"
+description = "Linux Packet-Radio terminal inspired by documented WinSTOP workflows"
+requires-python = ">=3.11"
+authors = [{ name = "Boris" }]
+license = { text = "Private/Internal" }
+
+[project.scripts]
+linstop = "linstop.cli:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
