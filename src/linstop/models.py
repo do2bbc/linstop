@@ -53,6 +53,9 @@ class LinStopConfig:
     station: StationProfile = field(default_factory=lambda: StationProfile(call="DO2BBC"))
     ports: list[PortConfig] = field(default_factory=list)
     active_port: str = "igate-axudp"
+    connect_text: str = ""
+    quit_text: str = ""
+    info_text: str = ""
 
     def ensure_defaults(self) -> None:
         if not self.station.call:
@@ -79,13 +82,64 @@ class LinStopConfig:
 @dataclass(slots=True)
 class UserRecord:
     call: str
+    afu_call: str = ""
+    cb_call_1: str = ""
+    cb_call_2: str = ""
+    bbs_call: str = ""
+    node_call: str = ""
+    convers_call: str = ""
     name: str = ""
     qth: str = ""
     locator: str = ""
     phone: str = ""
+    email: str = ""
+    birthday: str = ""
+    afu_connect_via: str = ""
+    umlaut_mode: str = "dos437"
+    packet_length: int = 128
+    maxframe: int = 2
+    compression_encryption: str = "0"
+    compression_on_connect: bool = False
+    picture_path: str = ""
+    connect_text: str = ""
     home_bbs: str = ""
+    home_bbs_afu: str = ""
+    home_bbs_cb: str = ""
+    peer_sysop_password: str = ""
+    peer_bbs_password: str = ""
+    own_sysop_password: str = ""
+    own_bbs_password: str = ""
+    bbs_page_length: int = 25
+    bbs_enabled: bool = True
+    bbs_send_frame: bool = True
+    bbs_frame_sorting: bool = False
+    bbs_help_mode: str = "prompt"
+    no_connect_user: bool = False
+    no_connect_bbs: bool = False
+    no_connect_node: bool = False
+    no_connect_convers: bool = False
+    cannot_connect_user: bool = False
+    cannot_connect_bbs: bool = True
+    cannot_connect_node: bool = False
+    comments: str = ""
+    remote_exceptions: list[str] = field(default_factory=list)
+    bbs_no_write: bool = False
+    bbs_write_private_sysop_only: bool = False
+    bbs_write_private_everyone: bool = False
+    bbs_write_public_hold: bool = False
+    bbs_read_own_only: bool = False
+    bbs_no_cbox: bool = False
+    bbs_sysop_not_callable: bool = False
+    bbs_no_external_programs: bool = False
+    remote_control: str = "normal"
+    mh_format: str = "flexnet"
+    station_info: str = ""
+    software: dict[str, str] = field(default_factory=dict)
     connect_count: int = 0
+    login_count: int = 0
     last_connected_at: datetime | None = None
+    first_connected_at: datetime | None = None
+    last_bbs_login_at: datetime | None = None
     remote_allowed: bool = False
 
     def display_name(self) -> str:
@@ -109,6 +163,7 @@ class ChannelState:
     peer_call: str = ""
     connected_at: datetime | None = None
     connect_count: int = 0
+    input_text: str = ""
     events: list[QsoEvent] = field(default_factory=list)
 
     @property

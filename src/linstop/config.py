@@ -28,6 +28,9 @@ class ConfigStore:
             station=_dataclass_from_dict(StationProfile, data.get("station", {})),
             ports=[_dataclass_from_dict(PortConfig, item) for item in data.get("ports", [])],
             active_port=data.get("active_port", ""),
+            connect_text=data.get("connect_text", ""),
+            quit_text=data.get("quit_text", ""),
+            info_text=data.get("info_text", ""),
         )
         config.ensure_defaults()
         return config

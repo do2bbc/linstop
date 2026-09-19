@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tkinter as tk
 import queue
+import re
 import shutil
 import subprocess
 import threading
@@ -18,6 +19,8 @@ from .models import LinStopConfig, PortConfig, StationProfile, UserRecord
 from .session import LinStopSession
 from .storage import UserStore
 from .transport import Ax25CommandTransport, Ax25UdpTransport, LoopbackTransport, Transport
+from .user_dialog import UserDatabaseDialog
+from .variables import TemplateContext, render_template
 
 
 QSO_COLUMNS = 80
@@ -25,6 +28,62 @@ WINSTOP_BLUE = "#000080"
 WINSTOP_RED = "#ff0000"
 WINSTOP_GRAY = "#808080"
 WINSTOP_YELLOW = "#ffff00"
+CONNECTED_STATUS_RE = re.compile(r"^\*\*\*\s+(?:re)?connected\s+to\s+(?P<call>\S+)", re.IGNORECASE)
+
+
+def connected_status_call(text: str) -> str | None:
+    match = CONNECTED_STATUS_RE.match(text.strip())
+    if match is None:
+        return None
+    return match.group("call").rstrip(".,;:").upper()
+
+
+def channel_button_label(number: int, peer_call: str) -> str:
+    return f"{number}: {peer_call}" if peer_call else f"{number}"
+
+
+def connect_text_lines(text: str) -> list[str]:
+    return [line for line in text.replace("\r\n", "\r").replace("\n", "\r").split("\r") if line]
+
+
+def text_remote_command(text: str) -> str | None:
+    command_line = text.strip()
+    if not command_line.startswith("//"):
+        return None
+    command, _, _value = command_line[2:].strip().partition(" ")
+    command = command.upper()
+    if command in {"I", "INFO"}:
+        return "info"
+    if command in {"Q", "QUIT", "BYE"}:
+        return "quit"
+    return None
+
+
+def remote_echo_key(text: str) -> str | None:
+    stripped = text.strip()
+    if not stripped.startswith("//"):
+        return None
+    return " ".join(stripped.upper().split())
+
+
+def echo_line_key(text: str) -> str:
+    return " ".join(text.strip().split())
+
+
+def line_from_editor_text(text: str, line_number: int) -> str:
+    lines = text.split("\n")
+    if line_number < 1 or line_number > len(lines):
+        return ""
+    return lines[line_number - 1].replace("\n", "\r")
+
+
+def next_editor_line_after_send(text: str, line_number: int) -> tuple[str, int]:
+    lines = text.split("\n")
+    if line_number < len(lines):
+        return text, line_number + 1
+    if text:
+        return text + "\n", line_number + 1
+    return "", 1
 
 
 class LinStopWindow(tk.Tk):
@@ -45,6 +104,11 @@ class LinStopWindow(tk.Tk):
         self.monitor_process: subprocess.Popen[str] | None = None
         self.monitor_queue: queue.Queue[str] = queue.Queue()
         self.transport_poll_after_id: str | None = None
+        self.transport_channel: int | None = None
+        self.transport_channels: dict[str, int] = {}
+        self.channel_transport_peers: dict[int, str] = {}
+        self.sent_remote_echoes: list[str] = []
+        self.sent_text_echoes: list[str] = []
         self.closing = False
 
         self._build_theme()
@@ -53,9 +117,9 @@ class LinStopWindow(tk.Tk):
         self._build_status_panels()
         self._build_body()
         self._build_statusbar()
-        self._build_bottom_controls()
         self._refresh_users()
         self._set_status("Bereit")
+        self._start_passive_transport_poll()
 
     def _build_theme(self) -> None:
         style = ttk.Style(self)
@@ -87,6 +151,7 @@ class LinStopWindow(tk.Tk):
         tools.add_command(label="AX.25-Hexframe formatieren...", command=self._format_hex_frame_dialog)
         tools.add_command(label="AX.25-Beispielframe anzeigen", command=self._show_sample_ax25_frame)
         tools.add_separator()
+        tools.add_command(label="User-Datenbank...", command=self._open_user_database)
         tools.add_command(label="Einstellungen...", command=self._open_settings)
         tools.add_command(label="Userdaten speichern", command=self.store.save)
         menubar.add_cascade(label="Tools", menu=tools)
@@ -113,27 +178,17 @@ class LinStopWindow(tk.Tk):
         ttk.Label(toolbar, text=f"Port {self.default_port} | {self.transport_name}").pack(side=tk.RIGHT)
 
     def _build_status_panels(self) -> None:
-        banner = tk.Frame(self, background=WINSTOP_RED, height=78, relief=tk.SUNKEN, borderwidth=1)
+        banner = tk.Frame(self, background=WINSTOP_RED, height=106, relief=tk.SUNKEN, borderwidth=1)
         banner.pack(side=tk.TOP, fill=tk.X)
         banner.pack_propagate(False)
+        self._build_input(banner)
 
-        panels = tk.Frame(self, background=WINSTOP_BLUE, height=44, relief=tk.SUNKEN, borderwidth=1)
+        panels = tk.Frame(self, background=WINSTOP_BLUE, height=66, relief=tk.SUNKEN, borderwidth=1)
         panels.pack(side=tk.TOP, fill=tk.X)
         panels.pack_propagate(False)
 
-        channel = tk.LabelFrame(panels, text="Kanal", foreground=WINSTOP_YELLOW, background=WINSTOP_BLUE, borderwidth=1)
-        channel.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=4, pady=2)
         self.channel_status_var = tk.StringVar(value="Kanal 1")
-        tk.Label(channel, textvariable=self.channel_status_var, foreground="white", background=WINSTOP_BLUE, anchor=tk.W).pack(side=tk.LEFT, padx=4)
-        for label in ("Fernsteuerung", "RX ignorieren", "Sysop"):
-            tk.Checkbutton(channel, text=label, foreground="white", background=WINSTOP_BLUE, selectcolor=WINSTOP_BLUE, activebackground=WINSTOP_BLUE).pack(side=tk.LEFT, padx=6)
-
-        general = tk.LabelFrame(panels, text="Allgemein", foreground=WINSTOP_YELLOW, background=WINSTOP_BLUE, borderwidth=1)
-        general.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=4, pady=2)
-        self.connect_text_var = tk.StringVar(value="CText: Terminal")
-        tk.Label(general, textvariable=self.connect_text_var, foreground="white", background=WINSTOP_BLUE, anchor=tk.W).pack(side=tk.LEFT, padx=4)
-        for label in ("Klänge an", "Baken", "Wecker"):
-            tk.Checkbutton(general, text=label, foreground="white", background=WINSTOP_BLUE, selectcolor=WINSTOP_BLUE, activebackground=WINSTOP_BLUE).pack(side=tk.LEFT, padx=6)
+        self._build_channels(panels)
 
     def _build_body(self) -> None:
         outer = ttk.PanedWindow(self, orient=tk.HORIZONTAL)
@@ -163,6 +218,7 @@ class LinStopWindow(tk.Tk):
         mheard_frame = self._side_panel(right, "MHeard-Liste")
         self.user_list = tk.Listbox(mheard_frame, exportselection=False, font="TkFixedFont")
         self.user_list.pack(fill=tk.BOTH, expand=True)
+        self.user_list.bind("<Double-Button-1>", lambda _event: self._open_selected_user())
 
         info_frame = self._side_panel(right, "Info-Fenster")
         self.info_text = tk.Text(info_frame, height=7, wrap=tk.WORD, font="TkFixedFont")
@@ -199,23 +255,56 @@ class LinStopWindow(tk.Tk):
         self._build_input(bottom)
 
     def _build_channels(self, parent: ttk.Frame) -> None:
-        frame = ttk.Frame(parent)
-        frame.pack(fill=tk.X, pady=(0, 3))
-        self.channel_buttons: dict[int, ttk.Button] = {}
+        frame = tk.Frame(parent, background=WINSTOP_BLUE)
+        frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=6, pady=6)
+        self.channel_buttons: dict[int, tk.Label] = {}
+        self.channel_button_vars: dict[int, tk.StringVar] = {}
         for number in range(1, 11):
-            button = ttk.Button(frame, text=str(number), style="Channel.TButton", command=lambda item=number: self._switch_channel(item))
-            button.pack(side=tk.LEFT, padx=2)
+            frame.columnconfigure(number - 1, weight=1, uniform="channels")
+            text_var = tk.StringVar(value=str(number))
+            button = tk.Label(
+                frame,
+                textvariable=text_var,
+                width=1,
+                height=1,
+                padx=8,
+                pady=3,
+                anchor=tk.CENTER,
+                font="TkFixedFont",
+                foreground="black",
+                background="#ece9d8",
+                relief=tk.RAISED,
+                borderwidth=2,
+                highlightthickness=1,
+                highlightbackground="#404040",
+            )
+            button.bind("<Button-1>", lambda _event, item=number: self._switch_channel(item))
+            button.grid(row=0, column=number - 1, sticky="nsew", padx=3, pady=0)
             self.channel_buttons[number] = button
+            self.channel_button_vars[number] = text_var
         self._refresh_channel_buttons()
 
     def _build_input(self, parent: ttk.Frame) -> None:
-        frame = ttk.Frame(parent)
-        frame.pack(fill=tk.X)
-        ttk.Label(frame, text="Eingabe:").pack(side=tk.LEFT)
-        self.input_entry = ttk.Entry(frame, font="TkFixedFont")
-        self.input_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=4)
-        self.input_entry.bind("<Return>", lambda _event: self._send_input())
-        ttk.Button(frame, text="Senden", command=self._send_input).pack(side=tk.LEFT)
+        self.input_entry = tk.Text(
+            parent,
+            wrap=tk.WORD,
+            font="TkFixedFont",
+            undo=True,
+            background=WINSTOP_RED,
+            foreground="white",
+            insertbackground="white",
+            selectbackground=WINSTOP_BLUE,
+            selectforeground="white",
+            relief=tk.FLAT,
+            borderwidth=0,
+            highlightthickness=0,
+            padx=6,
+            pady=4,
+        )
+        self.input_entry.pack(fill=tk.BOTH, expand=True)
+        self.input_entry.bind("<Return>", self._send_input_event)
+        self.input_entry.bind("<KP_Enter>", self._send_input_event)
+        self.input_entry.bind("<Control-Return>", self._insert_input_cr)
 
     def _build_statusbar(self) -> None:
         self.status_var = tk.StringVar()
@@ -239,6 +328,8 @@ class LinStopWindow(tk.Tk):
             port = target.port or self.default_port
             if self.transport_name in {"ax25", "ax25udp"}:
                 self.session.transport = self._make_transport(port)
+                self.transport_channels.clear()
+                self.channel_transport_peers.clear()
             user = self.store.note_connect(target.call, datetime.now())
             self.session.connect(target.call, user=user, via=list(target.via))
             self.store.save()
@@ -250,37 +341,62 @@ class LinStopWindow(tk.Tk):
         self._refresh_mheard()
         self._refresh_users()
         self._refresh_channel_buttons()
+        self.channel_status_var.set(f"Kanal {self.session.current_channel}")
         self._set_status(f"Kanal {self.session.current_channel}: verbunden mit {target.call}")
+        self.transport_channel = self.session.current_channel
+        self.transport_channels[target.call.upper()] = self.session.current_channel
+        self.channel_transport_peers[self.session.current_channel] = target.call.upper()
         self._schedule_transport_poll(0)
 
     def _disconnect(self) -> None:
         self._cancel_transport_poll()
         try:
+            selector = getattr(self.session.transport, "select_peer", None)
+            physical_peer = self._transport_peer_for_channel(self.session.current_channel)
+            if selector is not None and physical_peer:
+                selector(physical_peer)
             self.session.disconnect()
         except Exception as exc:
             self._append_info(str(exc))
         self._append_info("Verbindung getrennt")
+        if self.transport_channel is not None:
+            physical_peer = self.channel_transport_peers.pop(self.transport_channel, "")
+            if physical_peer:
+                self.transport_channels.pop(physical_peer, None)
+        self.transport_channel = None
         self._refresh_channel_buttons()
         self._set_status("Getrennt")
+        self._start_passive_transport_poll()
 
     def _switch_channel(self, number: int) -> None:
+        self._save_current_input_buffer()
         self.session.switch_channel(number)
+        self._load_current_input_buffer()
         self._redraw_qso()
         self._refresh_channel_buttons()
+        suffix = f": {self.session.channel.peer_call}" if self.session.channel.peer_call else ""
         self.channel_status_var.set(f"Kanal {number}")
-        self._set_status(f"Kanal {number}")
+        self._set_status(f"Kanal {number}{suffix}")
 
-    def _send_input(self) -> None:
-        text = self.input_entry.get()
+    def _send_input(self) -> bool:
+        self._save_current_input_buffer()
+        line_number = self._current_input_line_number()
+        text = self._input_line_text(line_number)
         if not text:
-            return
-        self.input_entry.delete(0, tk.END)
+            return False
         user = self.store.get(self.session.channel.peer_call) if self.session.channel.peer_call else UserRecord(call="")
         try:
+            selector = getattr(self.session.transport, "select_peer", None)
+            physical_peer = self._transport_peer_for_channel(self.session.current_channel)
+            if selector is not None and physical_peer:
+                selector(physical_peer)
+                self.transport_channel = self.session.current_channel
+                self.transport_channels[physical_peer] = self.session.current_channel
             rendered = self.session.send_template(text, user=user)
         except Exception as exc:
             self._set_status(str(exc))
-            return
+            return False
+        self._remember_sent_remote_echo(physical_peer, rendered)
         self._append_qso("tx", rendered)
         peer_call = self.session.channel.peer_call or "CQ"
         if self.transport_name == "loopback":
@@ -288,6 +404,52 @@ class LinStopWindow(tk.Tk):
             self._append_monitor(format_ax25_frame(frame, port=self.default_port, direction="TX"))
         self._schedule_transport_poll(0)
         self._set_status("Gesendet")
+        return True
+
+    def _send_input_event(self, _event: tk.Event) -> str:
+        line_number = self._current_input_line_number()
+        if self._send_input():
+            self._advance_input_after_send(line_number)
+        return "break"
+
+    def _insert_input_cr(self, _event: tk.Event) -> str:
+        self.input_entry.insert(tk.INSERT, "\n")
+        self._save_current_input_buffer()
+        return "break"
+
+    def _input_text(self) -> str:
+        return self.input_entry.get("1.0", "end-1c").replace("\n", "\r")
+
+    def _editor_text(self) -> str:
+        return self.input_entry.get("1.0", "end-1c")
+
+    def _save_current_input_buffer(self) -> None:
+        if hasattr(self, "input_entry"):
+            self.session.channel.input_text = self._editor_text()
+
+    def _load_current_input_buffer(self) -> None:
+        self.input_entry.delete("1.0", tk.END)
+        if self.session.channel.input_text:
+            self.input_entry.insert("1.0", self.session.channel.input_text)
+
+    def _current_input_line_number(self) -> int:
+        return int(self.input_entry.index(tk.INSERT).split(".", 1)[0])
+
+    def _input_line_text(self, line_number: int) -> str:
+        return self.input_entry.get(f"{line_number}.0", f"{line_number}.end").replace("\n", "\r")
+
+    def _set_input_text(self, text: str) -> None:
+        self.input_entry.delete("1.0", tk.END)
+        self.input_entry.insert("1.0", text.replace("\r", "\n"))
+
+    def _advance_input_after_send(self, line_number: int) -> None:
+        new_text, new_line_number = next_editor_line_after_send(self._editor_text(), line_number)
+        if new_text != self._editor_text():
+            self.input_entry.delete("1.0", tk.END)
+            self.input_entry.insert("1.0", new_text)
+        self.input_entry.mark_set(tk.INSERT, f"{new_line_number}.0")
+        self.input_entry.see(tk.INSERT)
+        self._save_current_input_buffer()
 
     def _append_qso(self, direction: str, text: str) -> None:
         self.qso_text.configure(state=tk.NORMAL)
@@ -413,8 +575,11 @@ class LinStopWindow(tk.Tk):
     def _refresh_channel_buttons(self) -> None:
         for number, button in self.channel_buttons.items():
             channel = self.session.channels[number]
-            marker = "*" if channel.connected else ""
-            button.configure(text=f"{number}{marker}", style="Active.Channel.TButton" if number == self.session.current_channel else "Channel.TButton")
+            self.channel_button_vars[number].set(channel_button_label(number, channel.peer_call))
+            if number == self.session.current_channel:
+                button.configure(background="#c7d8ff", relief=tk.SUNKEN, highlightbackground="#ffffff")
+            else:
+                button.configure(background="#ece9d8", relief=tk.RAISED, highlightbackground="#404040")
 
     def _set_status(self, text: str) -> None:
         self.status_var.set(f"{datetime.now():%H:%M:%S}  {text}")
@@ -428,24 +593,36 @@ class LinStopWindow(tk.Tk):
             if receiver is not None:
                 for line in receiver():
                     self._append_monitor(line)
+            connected_receiver = getattr(self.session.transport, "receive_connected_peers", None)
+            connected_peers = connected_receiver() if connected_receiver is not None else ()
+            for peer_call in connected_peers:
+                self._assign_incoming_peer(peer_call)
+            peer_call = getattr(self.session.transport, "peer_call", "")
+            if peer_call and getattr(self.session.transport, "link_established", False) and self._channel_for_peer(peer_call) is None:
+                self._assign_incoming_peer(peer_call)
             qso_receiver = getattr(self.session.transport, "receive_qso_lines", None)
-            if qso_receiver is not None:
+            event_receiver = getattr(self.session.transport, "receive_qso_events", None)
+            if event_receiver is not None:
+                for peer_call, line in event_receiver():
+                    self._route_qso_line(peer_call, line)
+            elif qso_receiver is not None:
                 for line in qso_receiver():
-                    self.session.channel.append_rx(line)
-                    self._append_qso("rx", line)
+                    peer_call = getattr(self.session.transport, "peer_call", "")
+                    self._route_qso_line(peer_call, line)
         except Exception as exc:
             self._append_info(f"Monitorfehler: {exc}")
             self._set_status(f"Monitorfehler: {exc}")
             self.transport_poll_after_id = None
             return
-        if getattr(self.session.transport, "remote_disconnected", False):
+        disconnected_receiver = getattr(self.session.transport, "receive_disconnected_peers", None)
+        if disconnected_receiver is not None:
+            for peer_call in disconnected_receiver():
+                self._disconnect_peer_channel(peer_call)
+        elif getattr(self.session.transport, "remote_disconnected", False):
             setattr(self.session.transport, "remote_disconnected", False)
-            self.session.channel.disconnect()
-            self._append_info("Gegenstation hat getrennt")
-            self._refresh_channel_buttons()
-            self._set_status("Getrennt durch Gegenstation")
-            return
-        if self.session.channel.connected:
+            peer_call = getattr(self.session.transport, "peer_call", "")
+            self._disconnect_peer_channel(peer_call)
+        if self.session.channel.connected or getattr(self.session.transport, "listening", False):
             self._schedule_transport_poll(500)
         else:
             self.transport_poll_after_id = None
@@ -470,11 +647,201 @@ class LinStopWindow(tk.Tk):
     def _open_settings(self) -> None:
         SettingsDialog(self, self.config_model, self.config_store)
 
+    def _open_selected_user(self) -> None:
+        selection = self.user_list.curselection()
+        if not selection:
+            return
+        line = self.user_list.get(selection[0])
+        self._open_user_database(line.split()[0])
+
+    def _open_user_database(self, call: str | None = None) -> None:
+        UserDatabaseDialog(self, self.store, call)
+
+    def _channel_for_peer(self, peer_call: str) -> int | None:
+        normalized = peer_call.upper()
+        mapped = self.transport_channels.get(normalized)
+        if mapped is not None:
+            return mapped
+        for channel_number, physical_peer in self.channel_transport_peers.items():
+            if physical_peer == normalized:
+                return channel_number
+        for number, channel in self.session.channels.items():
+            if channel.connected and channel.peer_call == normalized:
+                return number
+        return None
+
+    def _transport_peer_for_channel(self, channel_number: int) -> str:
+        physical_peer = self.channel_transport_peers.get(channel_number)
+        if physical_peer:
+            return physical_peer
+        return self.session.channels[channel_number].peer_call
+
+    def _assign_incoming_peer(self, peer_call: str) -> int:
+        normalized = peer_call.upper()
+        existing = self._channel_for_peer(normalized)
+        if existing is not None:
+            return existing
+        self._save_current_input_buffer()
+        user = self.store.note_connect(normalized, datetime.now())
+        channel = self.session.connect_incoming(normalized, datetime.now())
+        self._load_current_input_buffer()
+        self.transport_channels[normalized] = channel.number
+        self.channel_transport_peers[channel.number] = normalized
+        self.transport_channel = channel.number
+        self._redraw_qso()
+        self._append_info(f"Eingehende Verbindung von {user.call}")
+        self._refresh_users()
+        self._refresh_channel_buttons()
+        self.channel_status_var.set(f"Kanal {channel.number}")
+        self._set_status(f"Kanal {channel.number}: eingehende Verbindung von {user.call}")
+        self._send_incoming_connect_text(channel.number, normalized)
+        return channel.number
+
+    def _send_incoming_connect_text(self, channel_number: int, physical_peer: str) -> None:
+        template = self.config_model.connect_text.strip()
+        if not template:
+            return
+        self._send_text_template(channel_number, physical_peer, template)
+
+    def _send_text_template(self, channel_number: int, physical_peer: str, template: str) -> None:
+        channel = self.session.channels[channel_number]
+        user = self.store.get(channel.peer_call or physical_peer)
+        rendered = render_template(template, TemplateContext(station=self.station, channel=channel, user=user))
+        selector = getattr(self.session.transport, "select_peer", None)
+        if selector is not None:
+            selector(physical_peer)
+        for line in connect_text_lines(rendered):
+            self.session.transport.send_line(line)
+            self._remember_sent_text_echo(physical_peer, line)
+            channel.append_tx(line)
+            if channel_number == self.session.current_channel:
+                self._append_qso("tx", line)
+
+    def _route_qso_line(self, peer_call: str, line: str) -> None:
+        if not peer_call:
+            self.session.channel.append_rx(line)
+            self._append_qso("rx", line)
+            return
+        channel_number = self._channel_for_peer(peer_call) or self._assign_incoming_peer(peer_call)
+        channel = self.session.channels[channel_number]
+        physical_peer = peer_call.upper()
+        self.session.mheard[physical_peer] = datetime.now()
+        if self._consume_sent_text_echo(physical_peer, line):
+            return
+        selector = getattr(self.session.transport, "select_peer", None)
+        if selector is not None:
+            selector(physical_peer)
+        previous_channel = self.session.current_channel
+        self.session.switch_channel(channel_number)
+        if self._consume_sent_remote_echo(physical_peer, line):
+            self.session.switch_channel(previous_channel)
+            return
+        handled_text_command = self._handle_text_remote_command(channel_number, physical_peer, line)
+        if handled_text_command:
+            self.session.switch_channel(previous_channel)
+            return
+        response = self.session.handle_remote_user_command(line, self.store.get(channel.peer_call or physical_peer))
+        if response is not None:
+            self.session.switch_channel(previous_channel)
+            if channel_number == self.session.current_channel:
+                self._append_qso("tx", response)
+            self.store.save()
+            self._refresh_users()
+            return
+        self.session.switch_channel(previous_channel)
+        channel.append_rx(line)
+        logical_peer = connected_status_call(line)
+        if logical_peer and logical_peer != channel.peer_call:
+            channel.peer_call = logical_peer
+            self._refresh_channel_buttons()
+            if channel_number == self.session.current_channel:
+                self.channel_status_var.set(f"Kanal {channel_number}")
+        if channel_number == self.session.current_channel:
+            self._append_qso("rx", line)
+
+    def _handle_text_remote_command(self, channel_number: int, physical_peer: str, line: str) -> bool:
+        command = text_remote_command(line)
+        if command is None:
+            return False
+        template = self.config_model.info_text if command == "info" else self.config_model.quit_text
+        if template.strip():
+            self._send_text_template(channel_number, physical_peer, template.strip())
+        if command == "quit":
+            selector = getattr(self.session.transport, "select_peer", None)
+            if selector is not None:
+                selector(physical_peer)
+            self.session.transport.disconnect()
+            self._disconnect_peer_channel(physical_peer)
+        return True
+
+    def _remember_sent_remote_echo(self, physical_peer: str, text: str) -> None:
+        for line in connect_text_lines(text):
+            key = remote_echo_key(line)
+            if key is not None:
+                self.sent_remote_echoes.append(key)
+
+    def _remember_sent_text_echo(self, physical_peer: str, text: str) -> None:
+        key = echo_line_key(text)
+        if key:
+            self.sent_text_echoes.append(key)
+
+    def _consume_sent_text_echo(self, physical_peer: str, text: str) -> bool:
+        key = echo_line_key(text)
+        if not key or key not in self.sent_text_echoes:
+            return False
+        self.sent_text_echoes.remove(key)
+        return True
+
+    def _consume_sent_remote_echo(self, physical_peer: str, text: str) -> bool:
+        key = remote_echo_key(text)
+        if key is None:
+            return False
+        if key not in self.sent_remote_echoes:
+            return False
+        self.sent_remote_echoes.remove(key)
+        return True
+
+    def _disconnect_peer_channel(self, peer_call: str) -> None:
+        if not peer_call:
+            return
+        normalized = peer_call.upper()
+        channel_number = self.transport_channels.pop(normalized, None) or self._channel_for_peer(normalized)
+        if channel_number is None:
+            return
+        self.channel_transport_peers.pop(channel_number, None)
+        was_current = channel_number == self.session.current_channel
+        previous_channel = self.session.current_channel
+        self.session.switch_channel(channel_number)
+        self.session.channel.disconnect()
+        if was_current:
+            self._redraw_qso()
+        else:
+            self.session.switch_channel(previous_channel)
+        self.transport_channel = None if self.transport_channel == channel_number else self.transport_channel
+        self._append_info(f"Gegenstation {normalized} hat getrennt")
+        self._refresh_channel_buttons()
+        self._set_status(f"Kanal {channel_number}: getrennt durch {normalized}")
+
+    def _start_passive_transport_poll(self) -> None:
+        listener = getattr(self.session.transport, "ensure_listening", None)
+        if listener is None:
+            return
+        try:
+            listener()
+        except Exception as exc:
+            self._append_info(f"AX25UDP-Lauschen nicht aktiv: {exc}")
+            return
+        self._schedule_transport_poll(500)
+
     def _close(self) -> None:
         self.closing = True
         self._cancel_transport_poll()
         try:
-            self.session.disconnect()
+            disconnect_all = getattr(self.session.transport, "disconnect_all", None)
+            if disconnect_all is not None:
+                disconnect_all()
+            else:
+                self.session.disconnect()
         except Exception:
             pass
         self._stop_live_monitor()
@@ -491,13 +858,22 @@ class SettingsDialog(tk.Toplevel):
         self.store = store
         self.station_vars: dict[str, tk.StringVar] = {}
         self.port_vars: dict[str, tk.StringVar] = {}
+        self.text_widgets: dict[str, tk.Text] = {}
         self.enabled_var = tk.BooleanVar(value=config.get_active_port().enabled)
         self._build()
         self.grab_set()
 
     def _build(self) -> None:
-        station_frame = ttk.LabelFrame(self, text="Persönliche Daten", padding=8)
-        station_frame.pack(fill=tk.X, padx=8, pady=8)
+        notebook = ttk.Notebook(self)
+        notebook.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+
+        station_tab = ttk.Frame(notebook, padding=8)
+        text_tab = ttk.Frame(notebook, padding=8)
+        port_tab = ttk.Frame(notebook, padding=8)
+        notebook.add(station_tab, text="Persoenliche Daten")
+        notebook.add(text_tab, text="Texte")
+        notebook.add(port_tab, text="Port")
+
         station_fields = (
             ("call", "Rufzeichen"),
             ("name", "Name"),
@@ -516,15 +892,17 @@ class SettingsDialog(tk.Toplevel):
             ("user_call_2", "User-Call 2"),
         )
         for row, (name, label) in enumerate(station_fields):
-            ttk.Label(station_frame, text=label).grid(row=row // 2, column=(row % 2) * 2, sticky=tk.W, padx=(0, 4), pady=2)
+            ttk.Label(station_tab, text=label).grid(row=row // 2, column=(row % 2) * 2, sticky=tk.W, padx=(0, 4), pady=2)
             var = tk.StringVar(value=str(getattr(self.config_model.station, name)))
             self.station_vars[name] = var
-            ttk.Entry(station_frame, textvariable=var, width=28).grid(row=row // 2, column=(row % 2) * 2 + 1, sticky=tk.W, padx=(0, 12), pady=2)
+            ttk.Entry(station_tab, textvariable=var, width=28).grid(row=row // 2, column=(row % 2) * 2 + 1, sticky=tk.W, padx=(0, 12), pady=2)
         self.station_vars["call"].trace_add("write", self._update_license_class)
 
+        self._build_text_editor(text_tab, "connect_text", "CText bei eingehender Verbindung", self.config_model.connect_text)
+        self._build_text_editor(text_tab, "quit_text", "QText bei //q, danach Disconnect", self.config_model.quit_text)
+        self._build_text_editor(text_tab, "info_text", "Info-Text bei //i, Verbindung bleibt", self.config_model.info_text)
+
         port = self.config_model.get_active_port()
-        port_frame = ttk.LabelFrame(self, text="Aktiver Port", padding=8)
-        port_frame.pack(fill=tk.X, padx=8, pady=(0, 8))
         port_fields = (
             ("name", "Name"),
             ("transport", "Transport"),
@@ -537,17 +915,25 @@ class SettingsDialog(tk.Toplevel):
             ("udp_local_port", "UDP-Quellport"),
         )
         for row, (name, label) in enumerate(port_fields):
-            ttk.Label(port_frame, text=label).grid(row=row, column=0, sticky=tk.W, padx=(0, 4), pady=2)
+            ttk.Label(port_tab, text=label).grid(row=row, column=0, sticky=tk.W, padx=(0, 4), pady=2)
             value = getattr(port, name)
             var = tk.StringVar(value="" if value is None else str(value))
             self.port_vars[name] = var
-            ttk.Entry(port_frame, textvariable=var, width=42).grid(row=row, column=1, sticky=tk.W, pady=2)
-        ttk.Checkbutton(port_frame, text="Aktiv", variable=self.enabled_var).grid(row=len(port_fields), column=1, sticky=tk.W, pady=2)
+            ttk.Entry(port_tab, textvariable=var, width=42).grid(row=row, column=1, sticky=tk.W, pady=2)
+        ttk.Checkbutton(port_tab, text="Aktiv", variable=self.enabled_var).grid(row=len(port_fields), column=1, sticky=tk.W, pady=2)
 
         buttons = ttk.Frame(self, padding=8)
         buttons.pack(fill=tk.X)
         ttk.Button(buttons, text="Speichern", command=self._save).pack(side=tk.RIGHT, padx=(4, 0))
         ttk.Button(buttons, text="Abbrechen", command=self.destroy).pack(side=tk.RIGHT)
+
+    def _build_text_editor(self, parent: ttk.Frame, name: str, title: str, value: str) -> None:
+        frame = ttk.LabelFrame(parent, text=title, padding=8)
+        frame.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
+        widget = tk.Text(frame, height=5, wrap=tk.WORD, font="TkFixedFont")
+        widget.pack(fill=tk.BOTH, expand=True)
+        widget.insert("1.0", value)
+        self.text_widgets[name] = widget
 
     def _update_license_class(self, *_args) -> None:
         inferred = infer_german_license_class(self.station_vars["call"].get())
@@ -557,6 +943,8 @@ class SettingsDialog(tk.Toplevel):
     def _save(self) -> None:
         for name, var in self.station_vars.items():
             setattr(self.config_model.station, name, var.get().strip())
+        for name, widget in self.text_widgets.items():
+            setattr(self.config_model, name, widget.get("1.0", tk.END).rstrip("\n"))
         port = self.config_model.get_active_port()
         port.name = self.port_vars["name"].get().strip() or port.name
         port.transport = self.port_vars["transport"].get().strip() or "ax25udp"

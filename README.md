@@ -32,6 +32,8 @@ Der Code trennt drei Schichten:
 - Verbindungsstartzeile im dokumentierten Format `{LinSTOP-<version>-<umlaut><flags>}`.
 - Textvariablen wie `%SCC`, `%UN`, `%UCC`, `%ZZ`, `%ZD`, `%NK`, `%NA`, `%Hxx` und `%%`.
 - JSON-basierte Userdatenbank.
+- WinSTOP-artiger Userdatenbankdialog mit Hauptseite, Passwort-/BBS-Rechten, Fernsteuer-/Info-Feldern und Software-Erkennung pro SSID.
+- Selbstpflege der Userdatenbank ueber WinSTOP-artige Fernsteuerbefehle wie `//QTH`, `//LOCATOR`, `//TEL`, `//EMAIL`, `//BIRTHDAY`, `//NAME` und `//PERSONAL`.
 - CLI für Connect, Textausgabe, Makrotest, MHeard und interaktiven Betrieb.
 - Native AX.25-Anbindung über `ax25_call`.
 - Direkte AX25UDP-Anbindung über UDP-Rohframes mit FCS, ohne `kissattach`/`ax25d`.
@@ -79,6 +81,8 @@ Validierter Test gegen `44.148.230.93:93`: `DO2BBC` connected zu `IGATE`, IGATE 
 Die Standardkonfiguration liegt unter `~/.config/linstop/config.json`. Sie enthält ein Stationsprofil und eine Portliste. Für Funkamateure sind Felder wie Rufzeichen, Name, QTH, QRA/Locator, DOK/Club, Lizenzklasse, Home-BBS, Node-Call, Convers-Call und weitere User-Calls vorgesehen.
 
 Im Einstellungsdialog wird die deutsche Klasse beim Bearbeiten des Rufzeichens konservativ vorgeschlagen. Die AfuV verweist in § 10 auf den von der Bundesnetzagentur veröffentlichten Rufzeichenplan; die App bildet daraus die praktischen Reihen ab: `DN1` bis `DN8` -> `Ausbildung`, `DN9` -> `N`, `DA6` und `DO` -> `E`, sonstige deutsche `D`-Afu-Reihen -> `A`. CB-artige Calls wie drei Buchstaben plus drei Zahlen (`DBW400`) oder Division/Club/Nummer (`13BB016`) werden als `CB-Funk` markiert. Sonderfälle können manuell gepflegt werden.
+
+Die Userdatenbank ist unter `Tools/User-Datenbank...` erreichbar. Der Dialog orientiert sich an den lokal installierten WinSTOP-Hilfeseiten `Help/userdb.html` und `Help/remote.html`, der WinSTOP-`Remote.ini` sowie den vier Referenz-Screenshots aus `/home/boris/Bilder/Bildschirmfotos`. Eingehende `//`-Fernsteuerbefehle aktualisieren den Eintrag der verbundenen Gegenstation und werden automatisch bestaetigt.
 
 Der Default-Port heißt `igate-axudp` und zeigt auf `44.148.230.93:93` mit lokalem UDP-Port `10093`. In der GUI ist der Dialog unter `Tools/Einstellungen...` erreichbar.
 

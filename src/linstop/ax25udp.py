@@ -8,6 +8,7 @@ from .ax25 import Ax25DecodeError, decode_ax25_frame, encode_ax25ip_datagram, en
 
 SABM_P = 0x3F
 DISC_P = 0x53
+DM_F = 0x0F
 
 
 class Ax25UdpError(RuntimeError):
@@ -105,6 +106,11 @@ def build_sabm_frame(source: str, destination: str, via: tuple[str, ...] = ()) -
 
 def build_disc_frame(source: str, destination: str, via: tuple[str, ...] = ()) -> bytes:
     frame = encode_unnumbered_frame(source, destination, DISC_P, via)
+    return encode_ax25ip_datagram(frame)
+
+
+def build_dm_frame(source: str, destination: str, via: tuple[str, ...] = ()) -> bytes:
+    frame = encode_unnumbered_frame(source, destination, DM_F, via)
     return encode_ax25ip_datagram(frame)
 
 

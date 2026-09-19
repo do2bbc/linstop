@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from typing import Protocol, TextIO
 
 from .ax25 import format_ax25ip_datagram
-from .ax25udp import Ax25UdpEndpoint, Ax25UdpSocket, build_disc_frame, build_i_frame, build_rr_frame, build_sabm_frame, build_ui_frame, build_ua_frame, decode_ax25ip_packet
+from .ax25udp import Ax25UdpEndpoint, Ax25UdpSocket, build_disc_frame, build_dm_frame, build_i_frame, build_rr_frame, build_sabm_frame, build_ui_frame, build_ua_frame, decode_ax25ip_packet
 
 
 class Transport(Protocol):
@@ -81,6 +81,16 @@ class Ax25CommandTransport:
 
 
 @dataclass(slots=True)
+class Ax25UdpLinkState:
+    peer_call: str
+    via: tuple[str, ...] = ()
+    send_state: int = 0
+    receive_state: int = 0
+    link_established: bool = False
+    pending_qso_text: str = ""
+
+
+@dataclass(slots=True)
 class Ax25UdpTransport:
     local_call: str
     endpoint: Ax25UdpEndpoint = field(default_factory=Ax25UdpEndpoint)
@@ -94,48 +104,90 @@ class Ax25UdpTransport:
     pending_monitor_lines: list[str] = field(default_factory=list)
     pending_qso_lines: list[str] = field(default_factory=list)
     pending_qso_text: str = ""
+    links: dict[str, Ax25UdpLinkState] = field(default_factory=dict)
+    pending_qso_events: list[tuple[str, str]] = field(default_factory=list)
+    pending_connected_peers: list[str] = field(default_factory=list)
+    pending_disconnected_peers: list[str] = field(default_factory=list)
+
+    @property
+    def listening(self) -> bool:
+        return self.socket is not None
+
+    def ensure_listening(self) -> None:
+        if self.socket is None:
+            self.socket = Ax25UdpSocket(self.endpoint)
+        if not self.socket.is_open():
+            self.socket.open()
 
     def connect(self, peer_call: str, via: list[str]) -> None:
-        self.peer_call = peer_call.upper()
-        self.via = tuple(item.upper() for item in via)
-        self.socket = Ax25UdpSocket(self.endpoint)
+        peer = peer_call.upper()
+        link = self._link(peer)
+        link.via = tuple(item.upper() for item in via)
+        self._select_link(peer)
+        if self.socket is None:
+            self.socket = Ax25UdpSocket(self.endpoint)
         self.remote_disconnected = False
         try:
-            frame = build_sabm_frame(self.local_call, self.peer_call, self.via)
+            frame = build_sabm_frame(self.local_call, link.peer_call, link.via)
             self.socket.send(frame)
             self._append_tx_monitor(frame)
             self.pending_monitor_lines.extend(self._read_monitor_lines(limit=10))
         except Exception:
             self.socket.close()
             self.socket = None
-            self.peer_call = ""
-            self.via = ()
+            self.links.pop(peer, None)
+            self._select_link(next(iter(self.links), ""))
             raise
 
+    def select_peer(self, peer_call: str) -> None:
+        self._select_link(peer_call.upper())
+
     def disconnect(self) -> None:
-        if self.socket is not None and self.peer_call:
+        peer = self.peer_call
+        link = self.links.get(peer) if peer else None
+        if self.socket is not None and link is not None:
             try:
                 if self.socket.is_open():
-                    frame = build_disc_frame(self.local_call, self.peer_call, self.via)
+                    frame = build_disc_frame(self.local_call, link.peer_call, link.via)
                     self.socket.send(frame)
                     self._append_tx_monitor(frame)
             except Exception:
                 pass
-            self.socket.close()
+            self.links.pop(peer, None)
+        self._select_link(next(iter(self.links), ""))
+        self.remote_disconnected = False
+
+    def disconnect_all(self) -> None:
+        if self.socket is not None:
+            for link in list(self.links.values()):
+                try:
+                    if self.socket.is_open():
+                        frame = build_disc_frame(self.local_call, link.peer_call, link.via)
+                        self.socket.send(frame)
+                        self._append_tx_monitor(frame)
+                except Exception:
+                    pass
+            try:
+                self.socket.close()
+            except Exception:
+                pass
         self.socket = None
-        self.peer_call = ""
-        self.via = ()
-        self.link_established = False
+        self.links.clear()
+        self.pending_connected_peers.clear()
+        self.pending_disconnected_peers.clear()
+        self._select_link("")
         self.remote_disconnected = False
 
     def send_line(self, text: str) -> None:
-        if self.socket is None or not self.peer_call:
+        link = self.links.get(self.peer_call) or (self._link(self.peer_call) if self.peer_call else None)
+        if self.socket is None or link is None:
             raise RuntimeError("AX25UDP-Verbindung ist nicht offen")
         self.pending_monitor_lines.extend(self._read_monitor_lines(limit=10))
-        frame = build_i_frame(self.local_call, self.peer_call, text + "\r", ns=self.send_state, nr=self.receive_state, via=self.via)
+        frame = build_i_frame(self.local_call, link.peer_call, text + "\r", ns=link.send_state, nr=link.receive_state, via=link.via)
         self.socket.send(frame)
         self._append_tx_monitor(frame)
-        self.send_state = (self.send_state + 1) % 8
+        link.send_state = (link.send_state + 1) % 8
+        self._sync_legacy_state(link)
 
     def receive_monitor_lines(self) -> tuple[str, ...]:
         lines = [*self.pending_monitor_lines]
@@ -148,6 +200,21 @@ class Ax25UdpTransport:
         lines = tuple(self.pending_qso_lines)
         self.pending_qso_lines.clear()
         return lines
+
+    def receive_qso_events(self) -> tuple[tuple[str, str], ...]:
+        events = tuple(self.pending_qso_events)
+        self.pending_qso_events.clear()
+        return events
+
+    def receive_connected_peers(self) -> tuple[str, ...]:
+        peers = tuple(self.pending_connected_peers)
+        self.pending_connected_peers.clear()
+        return peers
+
+    def receive_disconnected_peers(self) -> tuple[str, ...]:
+        peers = tuple(self.pending_disconnected_peers)
+        self.pending_disconnected_peers.clear()
+        return peers
 
     def _read_monitor_lines(self, limit: int = 20) -> list[str]:
         if self.socket is None:
@@ -162,45 +229,102 @@ class Ax25UdpTransport:
             frame = decode_ax25ip_packet(packet.data)
         except Exception:
             return formatted
-        if frame.destination.call != self.local_call.split("-", 1)[0].upper():
+        local_base_call = self.local_call.split("-", 1)[0].upper()
+        if frame.destination.call != local_base_call:
             return formatted
+        if frame.source.call == local_base_call:
+            return formatted
+        source = frame.source.label().rstrip("*")
+        source_via = tuple(address.label().rstrip("*") for address in frame.digipeaters)
         if frame.control.name == "UA":
-            self.link_established = True
-        elif frame.control.name == "DISC":
-            ua_frame = build_ua_frame(self.local_call, self.peer_call, self.via)
+            link = self.links.get(source) or self.links.get(self.peer_call)
+            if link is not None:
+                link.link_established = True
+                self._select_link(link.peer_call)
+        elif frame.control.name == "SABM":
+            link = self._link(source)
+            link.via = tuple(address.label().rstrip("*") for address in frame.digipeaters)
+            link.send_state = 0
+            link.receive_state = 0
+            link.pending_qso_text = ""
+            link.link_established = True
+            self.remote_disconnected = False
+            self._select_link(link.peer_call)
+            if link.peer_call not in self.pending_connected_peers:
+                self.pending_connected_peers.append(link.peer_call)
+            ua_frame = build_ua_frame(self.local_call, link.peer_call, link.via)
             self.socket.send(ua_frame)
             self._append_tx_monitor(ua_frame)
-            self.link_established = False
-            self.remote_disconnected = True
-            self.socket.close()
-            self.socket = None
+        elif frame.control.name == "DISC":
+            link = self.links.get(source)
+            if link is None:
+                dm_frame = build_dm_frame(self.local_call, source, source_via)
+                self.socket.send(dm_frame)
+                self._append_tx_monitor(dm_frame)
+                return formatted
+            ua_frame = build_ua_frame(self.local_call, link.peer_call, link.via)
+            self.socket.send(ua_frame)
+            self._append_tx_monitor(ua_frame)
+            self.links.pop(link.peer_call, None)
+            self.pending_disconnected_peers.append(link.peer_call)
+            self.remote_disconnected = self.peer_call == link.peer_call
+            self._select_link(next(iter(self.links), ""))
         elif frame.control.family == "I" and frame.control.ns is not None:
-            self.receive_state = (frame.control.ns + 1) % 8
-            lines, self.pending_qso_text = _decode_qso_payload(frame.payload, self.pending_qso_text)
+            link = self.links.get(source)
+            if link is None:
+                dm_frame = build_dm_frame(self.local_call, source, source_via)
+                self.socket.send(dm_frame)
+                self._append_tx_monitor(dm_frame)
+                return formatted
+            link.receive_state = (frame.control.ns + 1) % 8
+            lines, link.pending_qso_text = _decode_qso_payload(frame.payload)
             self.pending_qso_lines.extend(lines)
-            rr_frame = build_rr_frame(self.local_call, self.peer_call, nr=self.receive_state, via=self.via, poll_final=frame.control.poll_final)
+            self.pending_qso_events.extend((link.peer_call, line) for line in lines)
+            rr_frame = build_rr_frame(self.local_call, link.peer_call, nr=link.receive_state, via=link.via, poll_final=frame.control.poll_final)
             self.socket.send(rr_frame)
             self._append_tx_monitor(rr_frame)
-        elif frame.control.name == "RR" and frame.control.nr is not None:
-            pass
+            self._sync_legacy_state(link)
+        elif frame.control.family == "S":
+            link = self.links.get(source)
+            if link is None:
+                dm_frame = build_dm_frame(self.local_call, source, source_via)
+                self.socket.send(dm_frame)
+                self._append_tx_monitor(dm_frame)
+                return formatted
         return formatted
 
     def _append_tx_monitor(self, frame: bytes) -> None:
         self.pending_monitor_lines.append(format_ax25ip_datagram(frame, port=f"{self.endpoint.remote_host}:{self.endpoint.remote_port}", direction="TX"))
 
+    def _link(self, peer_call: str) -> Ax25UdpLinkState:
+        peer = peer_call.upper()
+        if peer not in self.links:
+            self.links[peer] = Ax25UdpLinkState(peer_call=peer)
+        return self.links[peer]
+
+    def _select_link(self, peer_call: str) -> None:
+        peer = peer_call.upper()
+        self.peer_call = peer
+        link = self.links.get(peer)
+        if link is None:
+            self.via = ()
+            self.send_state = 0
+            self.receive_state = 0
+            self.link_established = False
+            self.pending_qso_text = ""
+            return
+        self._sync_legacy_state(link)
+
+    def _sync_legacy_state(self, link: Ax25UdpLinkState) -> None:
+        self.peer_call = link.peer_call
+        self.via = link.via
+        self.send_state = link.send_state
+        self.receive_state = link.receive_state
+        self.link_established = link.link_established
+        self.pending_qso_text = link.pending_qso_text
+
 
 def _decode_qso_payload(payload: bytes, pending: str = "") -> tuple[list[str], str]:
     text = pending + payload.decode("latin-1", errors="replace")
     text = text.replace("\r\n", "\r").replace("\n", "\r")
-    parts = text.split("\r")
-    if text.endswith("\r"):
-        complete = parts[:-1]
-        remainder = ""
-    else:
-        complete = parts[:-1]
-        remainder = parts[-1]
-    lines = [line for line in complete if line]
-    if remainder.endswith("=>"):
-        lines.append(remainder)
-        remainder = ""
-    return lines, remainder
+    return [line for line in text.split("\r") if line], ""

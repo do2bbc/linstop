@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import asdict
+from dataclasses import fields
 from datetime import datetime
 from pathlib import Path
 
@@ -17,10 +18,14 @@ class UserStore:
         if not self.path.exists():
             return
         data = json.loads(self.path.read_text(encoding="utf-8"))
+        field_names = {field.name for field in fields(UserRecord)}
+        date_fields = {"last_connected_at", "first_connected_at", "last_bbs_login_at"}
         for item in data.get("users", []):
-            last_connected_at = item.get("last_connected_at")
-            item["last_connected_at"] = datetime.fromisoformat(last_connected_at) if last_connected_at else None
-            record = UserRecord(**item)
+            record_data = {name: value for name, value in item.items() if name in field_names}
+            for name in date_fields:
+                value = record_data.get(name)
+                record_data[name] = datetime.fromisoformat(value) if value else None
+            record = UserRecord(**record_data)
             self._records[record.call.upper()] = record
 
     def save(self) -> None:
@@ -28,7 +33,9 @@ class UserStore:
         users = []
         for record in sorted(self._records.values(), key=lambda item: item.call.upper()):
             data = asdict(record)
-            data["last_connected_at"] = record.last_connected_at.isoformat() if record.last_connected_at else None
+            for name in ("last_connected_at", "first_connected_at", "last_bbs_login_at"):
+                value = getattr(record, name)
+                data[name] = value.isoformat() if value else None
             users.append(data)
         self.path.write_text(json.dumps({"users": users}, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
@@ -43,6 +50,9 @@ class UserStore:
         record.connect_count += 1
         record.last_connected_at = at
         return record
+
+    def remove(self, call: str) -> None:
+        self._records.pop(call.upper(), None)
 
     def all(self) -> list[UserRecord]:
         return list(self._records.values())
